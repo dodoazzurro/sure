@@ -25,8 +25,17 @@ class Provider::Anthropic < Provider
       Setting.anthropic_access_token.present?
   end
 
+  # Claude Code-style OAuth access tokens ("sk-ant-oat01-...") authenticate
+  # via a Bearer token on the `authorization` header, not the `x-api-key`
+  # header real API keys use — and the API requires the oauth beta header
+  # on every request made with one. Detect by prefix so standard API keys
+  # (which don't have this prefix) keep using the default api_key: path.
+  OAUTH_TOKEN_PREFIX = "sk-ant-oat01-"
+  OAUTH_BETA_HEADER = "oauth-2025-04-20"
+
   def initialize(access_token, base_url: nil, model: nil)
-    client_options = { api_key: access_token }
+    @oauth_token = access_token.to_s.start_with?(OAUTH_TOKEN_PREFIX)
+    client_options = @oauth_token ? { auth_token: access_token } : { api_key: access_token }
     client_options[:base_url] = base_url if base_url.present?
     client_options[:timeout] = ENV.fetch("ANTHROPIC_REQUEST_TIMEOUT", 600).to_i
 
@@ -316,15 +325,24 @@ class Provider::Anthropic < Provider
     end
 
     def sync_chat_response(request_params:)
-      raw = client.messages.create(**request_params)
+      raw = client.messages.create(**request_params, request_options: oauth_request_options)
       parsed = ChatParser.new(raw).parsed
       usage = build_usage_hash(raw.usage)
       [ parsed, usage ]
     end
 
+    # OAuth access tokens (Claude Code-style "«redacted:sk-…»...") require
+    # this beta header on every request, not just at client construction —
+    # the SDK has no constructor-level hook for always-on extra headers.
+    def oauth_request_options
+      return {} unless @oauth_token
+
+      { extra_headers: { "anthropic-beta" => OAUTH_BETA_HEADER } }
+    end
+
     def stream_chat_response(streamer:, request_params:, on_partial: nil)
       final_message = nil
-      stream = client.messages.stream(**request_params)
+      stream = client.messages.stream(**request_params, request_options: oauth_request_options)
 
       # If `stream.each` raises mid-iteration (network drop, client abort),
       # we still want to surface whatever tokens accumulated so the cost
