@@ -43,14 +43,14 @@ jobs:
 
       - name: Fast-forward main to upstream
         run: |
-          git checkout main
+          git checkout -B main origin/main
           git merge --ff-only upstream/main
           git push origin main
 
       - name: Rebase patch branch onto new main
         id: rebase
         run: |
-          git checkout "$PATCH_BRANCH"
+          git checkout -B "$PATCH_BRANCH" "origin/$PATCH_BRANCH"
           if git rebase main; then
             echo "clean=true" >> "$GITHUB_OUTPUT"
           else
