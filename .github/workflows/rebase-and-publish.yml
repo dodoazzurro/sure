@@ -1,0 +1,108 @@
+name: Rebase patches onto upstream and publish image
+
+# Keeps our fork's single local patch (OAuth token support in the
+# Anthropic provider) current against we-promise/sure's main branch
+# without ever auto-resolving a conflict. On a clean rebase, builds and
+# pushes a new image. On a conflicting rebase, the job fails loudly and
+# notifies - never silently drops or mangles the patch.
+
+on:
+  schedule:
+    - cron: "17 4 * * *" # daily, arbitrary off-peak minute
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  UPSTREAM_REPO: https://github.com/we-promise/sure.git
+  PATCH_BRANCH: patches/oauth-token-support
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  rebase-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork (full history, needed for rebase)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git identity
+        run: |
+          git config user.name "dodoazzurro"
+          git config user.email "dodoazzurro@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: git remote add upstream "$UPSTREAM_REPO" || true
+
+      - name: Fetch upstream
+        run: git fetch upstream main
+
+      - name: Fast-forward main to upstream
+        run: |
+          git checkout main
+          git merge --ff-only upstream/main
+          git push origin main
+
+      - name: Rebase patch branch onto new main
+        id: rebase
+        run: |
+          git checkout "$PATCH_BRANCH"
+          if git rebase main; then
+            echo "clean=true" >> "$GITHUB_OUTPUT"
+          else
+            git rebase --abort
+            echo "clean=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Push rebased patch branch
+        if: steps.rebase.outputs.clean == 'true'
+        run: git push --force-with-lease origin "$PATCH_BRANCH"
+
+      - name: Open conflict issue and fail
+        if: steps.rebase.outputs.clean == 'false'
+        run: |
+          gh issue create \
+            --title "Rebase conflict: $PATCH_BRANCH onto upstream/main ($(date -I))" \
+            --body "Automated daily rebase hit a conflict rebasing \`$PATCH_BRANCH\` onto the latest \`upstream/main\`. The patch branch was left untouched (rebase was aborted) - resolve manually:
+
+          \`\`\`
+          git fetch upstream main
+          git checkout $PATCH_BRANCH
+          git rebase main
+          # resolve conflicts
+          git push --force-with-lease origin $PATCH_BRANCH
+          \`\`\`
+
+          No image was built this run." \
+            --label "automated,conflict"
+          exit 1
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to GHCR
+        if: steps.rebase.outputs.clean == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        if: steps.rebase.outputs.clean == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push image
+        if: steps.rebase.outputs.clean == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:${{ github.run_number }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
